@@ -20,11 +20,30 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
   while (true) {
     // Read header bytes
     protocolHandler.readHeaderBytes(header);
-
+    
     // Read stream bytes
     std::string buffer(header.streamLength, '\0');
-    protocolHandler.readStreamBytes(buffer, header.streamLength);
     msgpack::object_handle result;
+
+    // If client is just requesting a version pull
+    if (header.command == Command::Version && header.streamLength == 0) {
+      // Send all of our versions
+      RecordMap records;
+      for (auto &[fileName, fileInfo] : signatures) {
+        FileInfo info;
+        info.version = fileInfo.version;
+        records.insert({fileName, info});
+      }
+
+      msgpack::sbuffer sbuf;
+      msgpack::pack(sbuf, records);
+      protocolHandler.writeHeaderBytes(Command::Version, 0, sbuf.size());
+      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+
+      continue;
+    }
+
+    protocolHandler.readStreamBytes(buffer, header.streamLength);
     msgpack::unpack(result, buffer.data(), header.streamLength);
     switch (header.command) {
     case Command::Signature: {
@@ -32,10 +51,12 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
       break;
     }
     case Command::Update: {
-      // File name to update is stored in buffer
       result.get().convert(record);
-
-      // Check if version is the same
+      if (record.info.version < signatures[record.fileName].version) {
+        // Client file version is stale, tell client to pull versions
+        protocolHandler.writeHeaderBytes(Command::Version, 0, 0);
+        continue;
+      }
 
       // TODO: Mutex for the server signatures when all clients write
       // Send signature and then wait for a delta
@@ -52,16 +73,21 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
       FileHandler::patchFile(FileDelta{record.fileName, delta});
 
       // Increment version and let client know
-      LOG_DEBUG("Updating " << record.fileName);
+      auto &version = signatures[record.fileName].version;
+      version += 1;
+      FileRecord updatedRecord;
+      updatedRecord.fileName = record.fileName;
+      updatedRecord.info.version = version;
+
+      msgpack::sbuffer sbuf;
+      msgpack::pack(sbuf, updatedRecord);
+      protocolHandler.writeHeaderBytes(Command::Version, 0, sbuf.size());
+      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+
+      LOG_DEBUG("Updating " << record.fileName << " to v" << version);
       break;
     }
-    case Command::NotImplemented: {
-      LOG_ERROR("Not implemented!");
-      msgpack::sbuffer sbuf;
-      std::string ping = "Ping!";
-      msgpack::pack(sbuf, ping);
-      protocolHandler.writeHeaderBytes(Command::NotImplemented, 0, sbuf.size());
-      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+    case Command::Version: {
       break;
     }
     default:
@@ -155,4 +181,13 @@ ServerApplication::ServerApplication(const ApplicationConfig &config) : config(c
   }
 
   FileHandler::init(config.sharedFolderPath);
+
+  // Initialize server file versions
+  // TODO: Should be persistent (read from a file)
+  // Generate client file records / signatures and zero out versions
+  auto fileSignatures = FileHandler::generateSignatureBatch(config.sharedFolderPath);
+  for (auto &[fileName, signature] : fileSignatures) {
+    LOG_DEBUG("Initial record generation for " << fileName);
+    signatures.insert(std::make_pair(fileName, FileInfo{signature, 0}));
+  }
 }

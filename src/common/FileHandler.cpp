@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <Logging.hpp>
 
 namespace filesystem = std::filesystem;
 
@@ -86,9 +87,8 @@ SignatureMap FileHandler::generateSignatureBatch(const std::string &folderPath) 
   }
 
   for (auto &fileName : fileNames) {
-    std::string filePath = folderPath + fileName;
-    std::vector<char> buffer = FileHandler::generateSignature(filePath).signature;
-    signatures.insert({fileName, buffer});
+    std::vector<char> buffer = FileHandler::generateSignature(fileName).signature;
+    signatures.insert({fileName, std::move(buffer)});
   }
 
   return signatures;

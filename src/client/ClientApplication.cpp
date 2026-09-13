@@ -67,21 +67,10 @@ ClientApplication::ClientApplication(const ApplicationConfig &config) : config(c
   protocolHandler.emplace(ssl.get());
 
   // Generate client file records / signatures and zero out versions
-  std::vector<std::string> fileNames;
-  if (filesystem::exists(config.sharedFolderPath) && filesystem::is_directory(config.sharedFolderPath)) {
-    for (const auto &entry : filesystem::directory_iterator(config.sharedFolderPath)) {
-      std::string fileName = entry.path().filename().string();
-      fileNames.push_back(fileName);
-    }
-  } else {
-    throw std::runtime_error("Directory not found: " + config.sharedFolderPath);
-  }
-  for (auto &fileName : fileNames) {
+  auto fileSignatures = FileHandler::generateSignatureBatch(config.sharedFolderPath);
+  for (auto &[fileName, signature] : fileSignatures) {
     LOG_DEBUG("Initial record generation for " << fileName);
-    FileInfo record;
-    record.signature = FileHandler::generateSignature(fileName).signature;
-    record.version = 0;
-    signatures.insert({fileName, std::move(record)});
+    signatures.insert(std::make_pair(fileName, FileInfo{signature, 1}));
   }
 
   // Setup file watcher
@@ -95,13 +84,22 @@ ClientApplication::ClientApplication(const ApplicationConfig &config) : config(c
 }
 
 void ClientApplication::run() {
-  // That initial packet (WE NEED TO SEND THIS)
-  // TODO: At some point this, should just pull server versions
-  msgpack::sbuffer sbuf;
-  std::string ping = "Ping!";
-  msgpack::pack(sbuf, ping);
-  protocolHandler.value().writeHeaderBytes(Command::NotImplemented, /*flags=*/0, sbuf.size());
-  protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
+  // Pull server versions
+  protocolHandler.value().writeHeaderBytes(Command::Version, 0, 0);
+  protocolHandler.value().readHeaderBytes(header);
+  std::string buffer(header.streamLength, '\0');
+  protocolHandler.value().readStreamBytes(buffer, header.streamLength);
+  msgpack::object_handle result;
+  msgpack::unpack(result, buffer.data(), header.streamLength);
+
+  RecordMap records;
+  result.get().convert(records);
+  for (auto &[fileName, info] : records) {
+    // For each outdated record, pull a new one
+    if (signatures[fileName].version < info.version) {
+      // TODO
+    }
+  }
 
   int fd = SSL_get_fd(ssl.get());
   while (true) {
@@ -141,7 +139,12 @@ void ClientApplication::run() {
 
         break;
       }
-      case Command::NotImplemented: {
+      case Command::Version: {
+        // Update our version with server's authoritative version
+        FileRecord updatedRecord;
+        result.get().convert(updatedRecord);
+        signatures[updatedRecord.fileName].version = updatedRecord.info.version;
+        LOG_DEBUG("Updating " << updatedRecord.fileName << " to v" << updatedRecord.info.version);
       }
       default:
         break;
