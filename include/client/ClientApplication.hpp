@@ -14,6 +14,8 @@
 
 #define RECURSIVE_FILE_WATCH 0
 
+namespace filesystem = std::filesystem;
+
 class ClientApplication {
 public:
   /**

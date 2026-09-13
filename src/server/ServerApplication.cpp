@@ -16,7 +16,7 @@ namespace filesystem = std::filesystem;
 void ServerApplication::handleSSLSession(SSL *ssl) {
   ProtocolHandler protocolHandler(ssl);
   ProtocolHeader header;
-  std::string fileName;
+  FileRecord record;
   while (true) {
     // Read header bytes
     protocolHandler.readHeaderBytes(header);
@@ -28,29 +28,19 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
     msgpack::unpack(result, buffer.data(), header.streamLength);
     switch (header.command) {
     case Command::Signature: {
-      FileSignaturePair clientSignature;
-      result.get().convert(clientSignature);
-
-      // Generate file deltas and send over
-      Delta delta = FileHandler::generateDelta(clientSignature);
-      msgpack::sbuffer sbuf;
-      msgpack::pack(sbuf, delta);
-      protocolHandler.writeHeaderBytes(Command::Delta, 0, sbuf.size());
-      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+      
       break;
     }
     case Command::Update: {
       // File name to update is stored in buffer
-      result.get().convert(fileName);
+      result.get().convert(record);
 
-      // Get signature for that filename
+      // Check if version is the same
+
       // TODO: Mutex for the server signatures when all clients write
-      auto &record = signatures[fileName];
-      record.signature = FileHandler::generateSignature(fileName).second;
-
       // Send signature and then wait for a delta
       msgpack::sbuffer sbuf;
-      msgpack::pack(sbuf, record.signature);
+      msgpack::pack(sbuf, FileHandler::generateSignature(record.fileName).signature);
       protocolHandler.writeHeaderBytes(Command::Signature, 0, sbuf.size());
       protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
       break;
@@ -59,10 +49,10 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
       // Apply delta
       Delta delta;
       result.get().convert(delta);
-      FileHandler::patchFile(std::make_pair(fileName, delta));
+      FileHandler::patchFile(FileDelta{record.fileName, delta});
 
       // Increment version and let client know
-      LOG_DEBUG("Updating " << fileName);
+      LOG_DEBUG("Updating " << record.fileName);
       break;
     }
     case Command::NotImplemented: {

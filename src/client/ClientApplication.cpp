@@ -12,8 +12,6 @@
 #include <thread>
 #include <vector>
 
-namespace filesystem = std::filesystem;
-
 ClientApplication::ClientApplication(const ApplicationConfig &config) : config(config), listener(queue) {
   ctx.reset(SSL_CTX_new(TLS_client_method()));
   if (!ctx) {
@@ -80,8 +78,8 @@ ClientApplication::ClientApplication(const ApplicationConfig &config) : config(c
   }
   for (auto &fileName : fileNames) {
     LOG_DEBUG("Initial record generation for " << fileName);
-    FileRecord record;
-    record.signature = FileHandler::generateSignature(fileName).second;
+    FileInfo record;
+    record.signature = FileHandler::generateSignature(fileName).signature;
     record.version = 0;
     signatures.insert({fileName, std::move(record)});
   }
@@ -98,6 +96,7 @@ ClientApplication::ClientApplication(const ApplicationConfig &config) : config(c
 
 void ClientApplication::run() {
   // That initial packet (WE NEED TO SEND THIS)
+  // TODO: At some point this, should just pull server versions
   msgpack::sbuffer sbuf;
   std::string ping = "Ping!";
   msgpack::pack(sbuf, ping);
@@ -157,8 +156,8 @@ void ClientApplication::handleEdit(const FileEvent &event) {
   LOG_DEBUG("File " << event.fileName << " updated");
   msgpack::sbuffer sbuf;
   std::string fileName = event.fileName;
-  msgpack::pack(sbuf, fileName);
-  // Send server update command
+  msgpack::pack(sbuf, FileRecord{fileName, signatures[fileName]});
+  // Send server file record, containing fileName and version
   protocolHandler.value().writeHeaderBytes(Command::Update, 0, sbuf.size());
   protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
 
@@ -170,12 +169,9 @@ void ClientApplication::handleEdit(const FileEvent &event) {
   Signature serverSignature;
   result.get().convert(serverSignature);
 
-  // Calculate deltas
-  Delta delta = FileHandler::generateDelta(std::make_pair(fileName, serverSignature));
-
-  // Send deltas to patch with
+  // Calculate and send deltas to patch with
   sbuf.clear();
-  msgpack::pack(sbuf, delta);
+  msgpack::pack(sbuf, FileHandler::generateDelta(FileSignature{fileName, serverSignature}));
   protocolHandler.value().writeHeaderBytes(Command::Delta, 0, sbuf.size());
   protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
 }

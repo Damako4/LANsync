@@ -26,7 +26,7 @@ public:
  * @brief Enum defining the command being sent / recieved
  */
 enum class Command : uint8_t {
-    Signature = 0, ///<  Sending / recieving a @ref FileSignaturePair
+    Signature = 0, ///<  Sending / recieving a @ref FileSignature
     Delta = 1, ///< Sending / recieving a @ref Delta
     Update = 2, ///< Sending / recieving a ping for file update
     NotImplemented = 3 ///< Not implemented

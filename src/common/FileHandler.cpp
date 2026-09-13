@@ -13,8 +13,8 @@ void FileHandler::init(const std::string &path) {
   sharedFolderPath = path;
 }
 
-void FileHandler::patchFile(const FileDeltaPair &delta) {
-  std::string filePath = sharedFolderPath + delta.first;
+void FileHandler::patchFile(const FileDelta &delta) {
+  std::string filePath = sharedFolderPath + delta.fileName;
   filesystem::path tmpFilePath = filePath;
   tmpFilePath += ".tmp";
   FilePtr file(std::fopen(filePath.c_str(), "rb"));
@@ -27,8 +27,8 @@ void FileHandler::patchFile(const FileDeltaPair &delta) {
 
   unsigned char out_chunk[CHUNK_SIZE];
   rs_buffers_t buf = {0};
-  buf.next_in = const_cast<char*>(delta.second.data());
-  buf.avail_in = delta.second.size();
+  buf.next_in = const_cast<char*>(delta.delta.data());
+  buf.avail_in = delta.delta.size();
   buf.eof_in = 1;
 
   rs_result result;
@@ -87,14 +87,14 @@ SignatureMap FileHandler::generateSignatureBatch(const std::string &folderPath) 
 
   for (auto &fileName : fileNames) {
     std::string filePath = folderPath + fileName;
-    std::vector<char> buffer = FileHandler::generateSignature(filePath).second;
+    std::vector<char> buffer = FileHandler::generateSignature(filePath).signature;
     signatures.insert({fileName, buffer});
   }
 
   return signatures;
 }
 
-FileSignaturePair FileHandler::generateSignature(const std::string &fileName) {
+FileSignature FileHandler::generateSignature(const std::string &fileName) {
   std::string filePath = sharedFolderPath + fileName;
   FilePtr file(std::fopen(filePath.data(), "rb"));
   if (!file) {
@@ -175,7 +175,7 @@ SignaturePtr FileHandler::loadSignatureFromBuffer(const std::vector<char> &buffe
   return std::unique_ptr<rs_signature_t, SignatureDeleter>(sumset);
 }
 
-FileDeltaPair FileHandler::threadComputeDelta(const std::vector<char> &signatureBuffer, const std::string &filePath, const std::string &fileName) {
+FileDelta FileHandler::threadComputeDelta(const std::vector<char> &signatureBuffer, const std::string &filePath, const std::string &fileName) {
   FilePtr file(std::fopen(filePath.c_str(), "rb"));
   if (!file) {
     std::perror("File opening failed");
@@ -211,16 +211,16 @@ FileDeltaPair FileHandler::threadComputeDelta(const std::vector<char> &signature
   return {fileName, std::move(deltaBuffer)};
 }
 
-Delta FileHandler::generateDelta(const FileSignaturePair &toPatchSignaturePair) {
-    std::string filePath = sharedFolderPath + toPatchSignaturePair.first;
-    return FileHandler::threadComputeDelta(toPatchSignaturePair.second, filePath, toPatchSignaturePair.first).second;
+Delta FileHandler::generateDelta(const FileSignature &toPatchSignaturePair) {
+    std::string filePath = sharedFolderPath + toPatchSignaturePair.fileName;
+    return FileHandler::threadComputeDelta(toPatchSignaturePair.signature, filePath, toPatchSignaturePair.fileName).delta;
 }
 
 DeltaMap FileHandler::generateDeltas(const SignatureMap &authoritativeSignature, const SignatureMap &toPatchSignature) {
   DeltaMap deltas;
   ThreadPool pool(CPU_CORES);
 
-  std::vector<std::future<FileDeltaPair>> fileToDeltaPairs;
+  std::vector<std::future<FileDelta>> fileToDeltaPairs;
 
   // For each signature, compute delta and add to pairs
   for (auto &[fileName, signatureBuffer] : toPatchSignature) {
@@ -234,8 +234,8 @@ DeltaMap FileHandler::generateDeltas(const SignatureMap &authoritativeSignature,
 
   // Colllect results
   for (auto &fut : fileToDeltaPairs) {
-    FileDeltaPair result = fut.get();
-    deltas.insert(std::move(result));
+    FileDelta result = fut.get();
+    deltas.insert(std::move(std::make_pair(result.fileName, result.delta)));
   }
 
   return deltas;

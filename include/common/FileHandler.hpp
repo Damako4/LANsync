@@ -23,17 +23,17 @@ public:
     /**
      * @brief Patch file in @p delta with the delta contained
      * 
-     * @param delta @ref FileDeltaPair containing the fileName and delta
+     * @param delta @ref FileDelta containing the fileName and delta
      */
-    static void patchFile(const FileDeltaPair &delta);
+    static void patchFile(const FileDelta &delta);
     
     /**
      * @brief Generate signature for @p fileName
      * 
      * @param fileName The name of the file
-     * @return A FileSignaturePair containing @p fileName and signature
+     * @return A FileSignature containing @p fileName and signature
      */
-    static FileSignaturePair generateSignature(const std::string &fileName);
+    static FileSignature generateSignature(const std::string &fileName);
 
     /**
      * @brief Generates signatures for all files in @p folderPath
@@ -50,7 +50,7 @@ public:
      * @param toPatchSignaturePair The signature to generate delta for file against
      * @return The computed @ref Delta
      */
-    static Delta generateDelta(const FileSignaturePair &toPatchSignaturePair);
+    static Delta generateDelta(const FileSignature &toPatchSignaturePair);
 
     /**
      * @brief Like @ref generateDelta but for a RecordMap
@@ -80,5 +80,5 @@ private:
      * @param fileName The name of the file
      * @return A pair with file name and computed computed
      */
-    static FileDeltaPair threadComputeDelta(const std::vector<char> &signatureBuffer, const std::string &filePath, const std::string &fileName);
+    static FileDelta threadComputeDelta(const std::vector<char> &signatureBuffer, const std::string &filePath, const std::string &fileName);
 };
