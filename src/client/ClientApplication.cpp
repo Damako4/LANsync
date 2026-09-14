@@ -131,12 +131,28 @@ void ClientApplication::run() {
       msgpack::object_handle result;
       msgpack::unpack(result, buffer.data(), header.streamLength);
       switch (header.command) {
-      case Command::Signature: {
+      case Command::Delta: {
+        // Patch with the delta we receive from the server
+        FileDelta fileDelta;
+        result.get().convert(fileDelta);
+        FileHandler::patchFile(fileDelta);
+        LOG_DEBUG("Updating " << fileDelta.fileName << " caused by other client.");
 
+        // Update our version with the servers
         break;
       }
       case Command::Update: {
+        // We need to ask for the latest file version and pull it
+        std::string fileName;
+        result.get().convert(fileName);
 
+        // Send our signature to server for delta calc
+        FileInfo &record = signatures[fileName];
+        record.signature = FileHandler::generateSignature(fileName).signature;
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, FileRecord{fileName, record});
+        protocolHandler.value().writeHeaderBytes(Command::Signature, 0, sbuf.size());
+        protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
         break;
       }
       case Command::Version: {
@@ -154,6 +170,8 @@ void ClientApplication::run() {
 
   shutdown();
 }
+
+
 
 void ClientApplication::handleEdit(const FileEvent &event) {
   LOG_DEBUG("File " << event.fileName << " updated");

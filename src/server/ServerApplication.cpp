@@ -37,7 +37,7 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
 
       msgpack::sbuffer sbuf;
       msgpack::pack(sbuf, records);
-      protocolHandler.writeHeaderBytes(Command::Version, 0, sbuf.size());
+      protocolHandler.writeHeaderBytes(Command::Update, 0, sbuf.size());
       protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
 
       continue;
@@ -47,14 +47,31 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
     msgpack::unpack(result, buffer.data(), header.streamLength);
     switch (header.command) {
     case Command::Signature: {
-      
+      FileRecord record;
+      result.get().convert(record);
+
+      // Calculate a delta for the client to patch with
+      msgpack::sbuffer sbuf;
+      msgpack::pack(sbuf, FileDelta{record.fileName, FileHandler::generateDelta(FileSignature{record.fileName, record.info.signature.value()})});
+      protocolHandler.writeHeaderBytes(Command::Delta, 0, sbuf.size());
+      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+
+      FileRecord updatedRecord;
+      updatedRecord.fileName = record.fileName;
+      updatedRecord.info.version = signatures[record.fileName].version;
+
+      msgpack::sbuffer sbuf;
+      msgpack::pack(sbuf, updatedRecord);
+      protocolHandler.writeHeaderBytes(Command::Version, 0, sbuf.size());
+      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
       break;
     }
     case Command::Update: {
       result.get().convert(record);
       if (record.info.version < signatures[record.fileName].version) {
-        // Client file version is stale, tell client to pull versions
-        protocolHandler.writeHeaderBytes(Command::Version, 0, 0);
+        // Client file version is stale, tell client to pull this file version
+        protocolHandler.writeHeaderBytes(Command::Update, 0, record.fileName.size());
+        protocolHandler.writeStreamBytes(record.fileName.data(), record.fileName.size());
         continue;
       }
 

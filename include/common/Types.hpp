@@ -22,7 +22,7 @@ using Signature = std::vector<char>;
  */
 struct FileInfo {
     std::optional<std::vector<char>> signature; ///< librsync signature of the file
-    uint64_t version = 0; 
+    uint64_t version = 0;  ///< Version of file
 
     MSGPACK_DEFINE(signature, version);
 };
@@ -31,8 +31,8 @@ struct FileInfo {
  * @brief Pair containing file name and its information
  */
 struct FileRecord {
-    std::string fileName;
-    FileInfo info;
+    std::string fileName; ///< File name
+    FileInfo info; ///< File info
 
     MSGPACK_DEFINE(fileName, info);
 };
@@ -55,7 +55,7 @@ struct FileSignature {
 };
 
 /**
- * @brief Maps a file's relative path to its current librsync signature.
+ * @brief Maps a file's relative path to @ref FileInfo
  */
 using RecordMap = std::map<std::string, FileInfo>;
 
