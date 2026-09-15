@@ -8,7 +8,7 @@ A LAN-based file synchronization application that keeps a shared folder in sync 
 
 📖 [Full API documentation](https://damako4.github.io/LANsync)
 
-![App Screenshot](https://imgur.com/a/dx7b4m6)
+![App Screenshot](https://i.imgur.com/kJgfZpq.png)
 
 ## Requirements
 
