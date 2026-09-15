@@ -24,28 +24,10 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
     // Read stream bytes
     std::string buffer(header.streamLength, '\0');
     msgpack::object_handle result;
-
-    // If client is just requesting a version pull
-    if (header.command == Command::Version && header.streamLength == 0) {
-      // Send all of our versions
-      RecordMap records;
-      for (auto &[fileName, fileInfo] : signatures) {
-        FileInfo info;
-        info.version = fileInfo.version;
-        records.insert({fileName, info});
-      }
-
-      msgpack::sbuffer sbuf;
-      msgpack::pack(sbuf, records);
-      protocolHandler.writeHeaderBytes(Command::Update, 0, sbuf.size());
-      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
-
-      continue;
-    }
-
     protocolHandler.readStreamBytes(buffer, header.streamLength);
     msgpack::unpack(result, buffer.data(), header.streamLength);
     switch (header.command) {
+    // When client file is out of date, they send this
     case Command::Signature: {
       FileRecord record;
       result.get().convert(record);
@@ -58,27 +40,47 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
 
       FileRecord updatedRecord;
       updatedRecord.fileName = record.fileName;
-      updatedRecord.info.version = signatures[record.fileName].version;
+      
+      auto sigIt = signatures.find(updatedRecord.fileName);
+      if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+      auto &[fileName, info] = *sigIt;
+      updatedRecord.info.version = info.version;
 
-      msgpack::sbuffer sbuf;
+      sbuf.clear();
       msgpack::pack(sbuf, updatedRecord);
-      protocolHandler.writeHeaderBytes(Command::Version, 0, sbuf.size());
+      protocolHandler.writeHeaderBytes(Command::Version, VERSION_WRITE, sbuf.size());
       protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
       break;
     }
+    // When client edits a file
     case Command::Update: {
       result.get().convert(record);
-      if (record.info.version < signatures[record.fileName].version) {
+
+      /* 
+       * TODO: Check if file name is on the server
+       * Use std::map.at()
+       */
+
+      auto sigIt = signatures.find(record.fileName);
+      if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+      auto &[fileName, info] = *sigIt;
+
+      if (record.info.version < info.version) {
         // Client file version is stale, tell client to pull this file version
-        protocolHandler.writeHeaderBytes(Command::Update, 0, record.fileName.size());
-        protocolHandler.writeStreamBytes(record.fileName.data(), record.fileName.size());
+        RecordMap records;
+        records.emplace(record.fileName, record.info);
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, records);
+        protocolHandler.writeHeaderBytes(Command::Version, VERSION_PULL, sbuf.size());
+        protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
         continue;
       }
 
       // TODO: Mutex for the server signatures when all clients write
       // Send signature and then wait for a delta
       msgpack::sbuffer sbuf;
-      msgpack::pack(sbuf, FileHandler::generateSignature(record.fileName).signature);
+      record.info.signature = FileHandler::generateSignature(record.fileName).signature;
+      msgpack::pack(sbuf, record.info.signature);
       protocolHandler.writeHeaderBytes(Command::Signature, 0, sbuf.size());
       protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
       break;
@@ -90,7 +92,11 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
       FileHandler::patchFile(FileDelta{record.fileName, delta});
 
       // Increment version and let client know
-      auto &version = signatures[record.fileName].version;
+      auto sigIt = signatures.find(record.fileName);
+      if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+      auto &[fileName, info] = *sigIt;
+
+      auto &version = info.version;
       version += 1;
       FileRecord updatedRecord;
       updatedRecord.fileName = record.fileName;
@@ -98,13 +104,35 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
 
       msgpack::sbuffer sbuf;
       msgpack::pack(sbuf, updatedRecord);
-      protocolHandler.writeHeaderBytes(Command::Version, 0, sbuf.size());
+      protocolHandler.writeHeaderBytes(Command::Version, VERSION_WRITE, sbuf.size());
       protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
 
       LOG_DEBUG("Updating " << record.fileName << " to v" << version);
       break;
     }
     case Command::Version: {
+      // Extract file records
+      RecordMap records;
+      result.get().convert(records);
+
+      // Compare versions and then send file deltas and versions for files that are stale
+      RecordMap staleFiles;
+      for (auto &[fileName, info] : records) {
+        auto sigIt = signatures.find(fileName);
+        if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+        auto &[serverFileName, serverInfo] = *sigIt;
+
+        version_t serverVersion = serverInfo.version;
+        if (info.version < serverVersion) {
+          staleFiles.emplace(fileName, FileInfo{FileHandler::generateDelta(FileSignature{fileName, info.signature.value()}), serverVersion});
+        }
+      }
+
+      // Send those stale deltas and versions
+      msgpack::sbuffer sbuf;
+      msgpack::pack(sbuf, staleFiles);
+      protocolHandler.writeHeaderBytes(Command::Version, VERSION_PULL, sbuf.size());
+      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
       break;
     }
     default:
@@ -205,6 +233,6 @@ ServerApplication::ServerApplication(const ApplicationConfig &config) : config(c
   auto fileSignatures = FileHandler::generateSignatureBatch(config.sharedFolderPath);
   for (auto &[fileName, signature] : fileSignatures) {
     LOG_DEBUG("Initial record generation for " << fileName);
-    signatures.insert(std::make_pair(fileName, FileInfo{signature, 0}));
+    signatures.emplace(fileName, FileInfo{signature, 1});
   }
 }

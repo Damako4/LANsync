@@ -6,7 +6,8 @@
 #include <map>
 #include <vector>
 
-#define FLAG_TEST 0x20
+#define VERSION_PULL 0x20
+#define VERSION_WRITE 0x10
 
 /**
  * @brief Thrown when the peer closes the connection cleanly before

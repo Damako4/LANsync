@@ -17,12 +17,14 @@ using Delta = std::vector<char>;
  */
 using Signature = std::vector<char>;
 
+typedef uint64_t version_t; ///< A file version
+
 /**
  * @brief Metadata for a single file
  */
 struct FileInfo {
     std::optional<std::vector<char>> signature; ///< librsync signature of the file
-    uint64_t version = 0;  ///< Version of file
+    version_t version = 0;  ///< Version of file
 
     MSGPACK_DEFINE(signature, version);
 };
@@ -44,6 +46,8 @@ struct FileRecord {
 struct FileDelta {
     std::string fileName;
     Delta delta;
+
+    MSGPACK_DEFINE(fileName, delta);
 };
 
 /**

@@ -87,8 +87,7 @@ SignatureMap FileHandler::generateSignatureBatch(const std::string &folderPath) 
   }
 
   for (auto &fileName : fileNames) {
-    std::vector<char> buffer = FileHandler::generateSignature(fileName).signature;
-    signatures.insert({fileName, std::move(buffer)});
+    signatures.emplace(fileName, FileHandler::generateSignature(fileName).signature);
   }
 
   return signatures;
@@ -235,7 +234,7 @@ DeltaMap FileHandler::generateDeltas(const SignatureMap &authoritativeSignature,
   // Colllect results
   for (auto &fut : fileToDeltaPairs) {
     FileDelta result = fut.get();
-    deltas.insert(std::move(std::make_pair(result.fileName, result.delta)));
+    deltas.emplace(std::move(result.fileName), std::move(result.delta));
   }
 
   return deltas;

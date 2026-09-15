@@ -70,7 +70,7 @@ ClientApplication::ClientApplication(const ApplicationConfig &config) : config(c
   auto fileSignatures = FileHandler::generateSignatureBatch(config.sharedFolderPath);
   for (auto &[fileName, signature] : fileSignatures) {
     LOG_DEBUG("Initial record generation for " << fileName);
-    signatures.insert(std::make_pair(fileName, FileInfo{signature, 1}));
+    signatures.emplace(fileName, FileInfo{signature, 0});
   }
 
   // Setup file watcher
@@ -85,21 +85,10 @@ ClientApplication::ClientApplication(const ApplicationConfig &config) : config(c
 
 void ClientApplication::run() {
   // Pull server versions
-  protocolHandler.value().writeHeaderBytes(Command::Version, 0, 0);
-  protocolHandler.value().readHeaderBytes(header);
-  std::string buffer(header.streamLength, '\0');
-  protocolHandler.value().readStreamBytes(buffer, header.streamLength);
-  msgpack::object_handle result;
-  msgpack::unpack(result, buffer.data(), header.streamLength);
-
-  RecordMap records;
-  result.get().convert(records);
-  for (auto &[fileName, info] : records) {
-    // For each outdated record, pull a new one
-    if (signatures[fileName].version < info.version) {
-      // TODO
-    }
-  }
+  msgpack::sbuffer sbuf;
+  msgpack::pack(sbuf, signatures);
+  protocolHandler.value().writeHeaderBytes(Command::Version, 0, sbuf.size());
+  protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
 
   int fd = SSL_get_fd(ssl.get());
   while (true) {
@@ -131,66 +120,96 @@ void ClientApplication::run() {
       msgpack::object_handle result;
       msgpack::unpack(result, buffer.data(), header.streamLength);
       switch (header.command) {
-      case Command::Delta: {
-        // Patch with the delta we receive from the server
-        FileDelta fileDelta;
-        result.get().convert(fileDelta);
-        FileHandler::patchFile(fileDelta);
-        LOG_DEBUG("Updating " << fileDelta.fileName << " caused by other client.");
-
-        // Update our version with the servers
-        break;
-      }
-      case Command::Update: {
-        // We need to ask for the latest file version and pull it
-        std::string fileName;
-        result.get().convert(fileName);
-
-        // Send our signature to server for delta calc
-        FileInfo &record = signatures[fileName];
-        record.signature = FileHandler::generateSignature(fileName).signature;
-        msgpack::sbuffer sbuf;
-        msgpack::pack(sbuf, FileRecord{fileName, record});
-        protocolHandler.value().writeHeaderBytes(Command::Signature, 0, sbuf.size());
-        protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
-        break;
-      }
       case Command::Version: {
-        // Update our version with server's authoritative version
-        FileRecord updatedRecord;
-        result.get().convert(updatedRecord);
-        signatures[updatedRecord.fileName].version = updatedRecord.info.version;
-        LOG_DEBUG("Updating " << updatedRecord.fileName << " to v" << updatedRecord.info.version);
+        if (header.flags & VERSION_WRITE) {
+          // Update our version with server's authoritative version
+          FileRecord updatedRecord;
+          result.get().convert(updatedRecord);
+          
+          auto sigIt = signatures.find(updatedRecord.fileName);
+          if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+          auto &[fileName, info] = *sigIt;
+
+          info.version = updatedRecord.info.version;
+          LOG_DEBUG("Updating " << updatedRecord.fileName << " to v" << updatedRecord.info.version);
+        } else if (header.flags & VERSION_PULL) {
+          // Patch with the new deltas and versions
+          RecordMap staleDeltas;
+          result.get().convert(staleDeltas);
+          for (auto &[fileName, serverInfo] : staleDeltas) {
+            LOG_DEBUG("Updating " << fileName << " to v" << serverInfo.version);
+
+            auto sigIt = signatures.find(fileName);
+            if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+            auto &[fn, info] = *sigIt;
+            info.version = serverInfo.version;
+
+            FileHandler::patchFile(FileDelta{fileName, serverInfo.signature.value()});
+          }
+        }
       }
       default:
         break;
       }
     }
+
+    shutdown();
   }
-
-  shutdown();
 }
-
-
 
 void ClientApplication::handleEdit(const FileEvent &event) {
   LOG_DEBUG("File " << event.fileName << " updated");
   msgpack::sbuffer sbuf;
-  std::string fileName = event.fileName;
-  msgpack::pack(sbuf, FileRecord{fileName, signatures[fileName]});
-  // Send server file record, containing fileName and version
+
+  // Send server file record, containing fileName and version (Command::Update)
+  auto sigIt = signatures.find(event.fileName);
+  if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+  auto &[fileName, info] = *sigIt;
+
+  msgpack::pack(sbuf, FileRecord{fileName, FileInfo{std::nullopt, info.version}});
   protocolHandler.value().writeHeaderBytes(Command::Update, 0, sbuf.size());
   protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
 
-  // Receive signatures
+  // Receive Command::Signature or Command::Version if file out of date
   protocolHandler.value().readHeaderBytes(header);
   std::string buffer(header.streamLength, '\0');
   protocolHandler.value().readStreamBytes(buffer, header.streamLength);
   msgpack::unpack(result, buffer.data(), header.streamLength);
+  if (header.command == Command::Version) {
+    // File out of date, send signature for server to generate delta with
+    sbuf.clear();
+    auto sigIt = signatures.find(fileName);
+    if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+    auto &[fileName, info] = *sigIt;
+
+    FileInfo &record = info;
+    record.signature = FileHandler::generateSignature(fileName).signature;
+    msgpack::sbuffer sbuf;
+    msgpack::pack(sbuf, FileRecord{fileName, record});
+    protocolHandler.value().writeHeaderBytes(Command::Signature, 0, sbuf.size());
+    protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
+
+    // Patch with the delta we receive from the server
+    FileDelta fileDelta;
+    protocolHandler.value().readHeaderBytes(header);
+    std::string buffer(header.streamLength, '\0');
+    protocolHandler.value().readStreamBytes(buffer, header.streamLength);
+    msgpack::unpack(result, buffer.data(), header.streamLength);
+
+    result.get().convert(fileDelta);
+    FileHandler::patchFile(fileDelta);
+    LOG_DEBUG("File out of date, requesting newer version: " << event.fileName);
+    /**
+     * TODO: Handle what happens when a client's version is stale,
+     * right now it just overwrites the user's changes to that file
+     */
+    return;
+  }
+
   Signature serverSignature;
   result.get().convert(serverSignature);
 
-  // Calculate and send deltas to patch with
+  // Send Command::Delta
   sbuf.clear();
   msgpack::pack(sbuf, FileHandler::generateDelta(FileSignature{fileName, serverSignature}));
   protocolHandler.value().writeHeaderBytes(Command::Delta, 0, sbuf.size());
