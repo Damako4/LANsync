@@ -172,20 +172,11 @@ void ClientApplication::handleEdit(const FileEvent &event) {
 
   // Receive Command::Signature or Command::Version if file out of date
   protocolHandler.value().readHeaderBytes(header);
-  std::string buffer(header.streamLength, '\0');
-  protocolHandler.value().readStreamBytes(buffer, header.streamLength);
-  msgpack::unpack(result, buffer.data(), header.streamLength);
   if (header.command == Command::Version) {
     // File out of date, send signature for server to generate delta with
     sbuf.clear();
-    auto sigIt = signatures.find(fileName);
-    if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
-    auto &[fileName, info] = *sigIt;
-
-    FileInfo &record = info;
-    record.signature = FileHandler::generateSignature(fileName).signature;
     msgpack::sbuffer sbuf;
-    msgpack::pack(sbuf, FileRecord{fileName, record});
+    msgpack::pack(sbuf, FileRecord{fileName, FileInfo{FileHandler::generateSignature(fileName).signature, 0 }}); // Version # doesn't matter, server will give latest
     protocolHandler.value().writeHeaderBytes(Command::Signature, 0, sbuf.size());
     protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
 
@@ -205,6 +196,11 @@ void ClientApplication::handleEdit(const FileEvent &event) {
      */
     return;
   }
+
+  std::string buffer(header.streamLength, '\0');
+  protocolHandler.value().readStreamBytes(buffer, header.streamLength);
+  msgpack::unpack(result, buffer.data(), header.streamLength);
+
 
   Signature serverSignature;
   result.get().convert(serverSignature);

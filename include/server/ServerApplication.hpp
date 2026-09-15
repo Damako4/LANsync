@@ -34,7 +34,7 @@ private:
      * @param ssl The active SSL connection to the client
      * @param records The client's RecordMap
      */
-    void sendStaleDeltas(ProtocolHandler &protocolHandler, const RecordMap &records);
+    void sendStaleDeltas(ProtocolHandler &protocolHandler, RecordMap &records);
 
     /**
      * @brief Handles an incoming SSL session and dispatch commands

@@ -17,6 +17,7 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
   ProtocolHandler protocolHandler(ssl);
   ProtocolHeader header;
   FileRecord record;
+  int counter = 1;
   while (true) {
     // Read header bytes
     protocolHandler.readHeaderBytes(header);
@@ -56,7 +57,7 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
     // When client edits a file
     case Command::Update: {
       result.get().convert(record);
-
+      
       /*
        * TODO: Check if file name is on the server
        * Use std::map.at()
@@ -69,7 +70,14 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
 
       if (record.info.version < info.version) {
         // Client file version is stale, send client deltas to patch with
-        sendStaleDeltas(protocolHandler, RecordMap{{fileName, record.info}});
+        /*
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, RecordMap{{record.fileName, FileInfo{FileHandler::generateDelta(FileSignature{record.fileName, record.info.signature.value()}), record.info.version}}});
+        protocolHandler.writeHeaderBytes(Command::Delta, 0, sbuf.size());
+        protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+        */
+
+        protocolHandler.writeHeaderBytes(Command::Version, VERSION_PULL, 0);
         continue;
       }
 
@@ -109,6 +117,12 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
       break;
     }
     case Command::Version: {
+      if (counter-- == 1) {
+        std::string message = "hello";
+        protocolHandler.writeHeaderBytes(Command::Signature, 0, message.size());
+        protocolHandler.writeStreamBytes(message.data(), message.size());
+        break;
+      }
       // Extract file records
       RecordMap records;
       result.get().convert(records);
@@ -123,7 +137,7 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
   }
 }
 
-void ServerApplication::sendStaleDeltas(ProtocolHandler &protocolHandler, const RecordMap &records) {
+void ServerApplication::sendStaleDeltas(ProtocolHandler &protocolHandler, RecordMap &records) {
   // Compare versions and then send file deltas and versions for files that are stale
   RecordMap staleFiles;
   for (auto &[fileName, info] : records) {
@@ -134,6 +148,7 @@ void ServerApplication::sendStaleDeltas(ProtocolHandler &protocolHandler, const 
 
     version_t serverVersion = serverInfo.version;
     if (info.version < serverVersion) {
+      LOG_DEBUG("Client record for " << fileName << "(v" << info.version << ")" << " out of date, sending latest v" << serverVersion);
       staleFiles.emplace(fileName, FileInfo{FileHandler::generateDelta(FileSignature{fileName, info.signature.value()}), serverVersion});
     }
   }
