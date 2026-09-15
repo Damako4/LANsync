@@ -9,6 +9,7 @@
 #include <librsync.h>
 #include <msgpack.hpp>
 #include <openssl/err.h>
+#include <sys/poll.h>
 #include <vector>
 
 namespace filesystem = std::filesystem;
@@ -17,128 +18,190 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
   ProtocolHandler protocolHandler(ssl);
   ProtocolHeader header;
   FileRecord record;
-  int counter = 1;
+
+  std::size_t myLastSeen = globalUpdateCounter.load(std::memory_order_acquire);
+
+  int fd = SSL_get_fd(ssl);
   while (true) {
-    // Read header bytes
-    protocolHandler.readHeaderBytes(header);
+    pollfd pfd{fd, POLLIN, 0};
+    int ret = poll(&pfd, 1, /*timeout ms=*/10);
 
-    // Read stream bytes
-    std::string buffer(header.streamLength, '\0');
-    msgpack::object_handle result;
-    protocolHandler.readStreamBytes(buffer, header.streamLength);
-    msgpack::unpack(result, buffer.data(), header.streamLength);
-    switch (header.command) {
-    // When client file is out of date, they send this
-    case Command::Signature: {
-      FileRecord record;
-      result.get().convert(record);
-
-      // Calculate a delta for the client to patch with
-      msgpack::sbuffer sbuf;
-      msgpack::pack(sbuf, FileDelta{record.fileName, FileHandler::generateDelta(FileSignature{record.fileName, record.info.signature.value()})});
-      protocolHandler.writeHeaderBytes(Command::Delta, 0, sbuf.size());
-      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
-
-      FileRecord updatedRecord;
-      updatedRecord.fileName = record.fileName;
-
-      auto sigIt = signatures.find(updatedRecord.fileName);
-      if (sigIt == signatures.end())
-        throw std::runtime_error("File was not found, directory listings not synced!");
-      auto &[fileName, info] = *sigIt;
-      updatedRecord.info.version = info.version;
-
-      sbuf.clear();
-      msgpack::pack(sbuf, updatedRecord);
-      protocolHandler.writeHeaderBytes(Command::Version, VERSION_WRITE, sbuf.size());
-      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
-      break;
+    if (ret < 0) {
+      if (errno == EINTR)
+        continue; // interrupted by a signal, just retry
+      throw std::runtime_error(std::string("poll failed: ") + std::strerror(errno));
     }
-    // When client edits a file
-    case Command::Update: {
-      result.get().convert(record);
-      
-      /*
-       * TODO: Check if file name is on the server
-       * Use std::map.at()
-       */
 
-      auto sigIt = signatures.find(record.fileName);
-      if (sigIt == signatures.end())
-        throw std::runtime_error("File was not found, directory listings not synced!");
-      auto &[fileName, info] = *sigIt;
+    if (pfd.revents & (POLLERR | POLLHUP)) {
+      break; // connection dropped
+    }
 
-      if (record.info.version < info.version) {
-        // Client file version is stale, send client deltas to patch with
-        /*
+    if (ret > 0 && (pfd.revents & POLLIN)) {
+      // Read header bytes
+      protocolHandler.readHeaderBytes(header);
+
+      // Read stream bytes
+      std::string buffer(header.streamLength, '\0');
+      msgpack::object_handle result;
+      protocolHandler.readStreamBytes(buffer, header.streamLength);
+      msgpack::unpack(result, buffer.data(), header.streamLength);
+      switch (header.command) {
+      // When client file is out of date, they send this
+      case Command::Signature: {
+        FileRecord record;
+        result.get().convert(record);
+
+        // Calculate a delta for the client to patch with
         msgpack::sbuffer sbuf;
-        msgpack::pack(sbuf, RecordMap{{record.fileName, FileInfo{FileHandler::generateDelta(FileSignature{record.fileName, record.info.signature.value()}), record.info.version}}});
+        msgpack::pack(sbuf, FileDelta{record.fileName, FileHandler::generateDelta(FileSignature{record.fileName, record.info.signature.value()})});
         protocolHandler.writeHeaderBytes(Command::Delta, 0, sbuf.size());
         protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
-        */
 
-        protocolHandler.writeHeaderBytes(Command::Version, VERSION_PULL, 0);
-        continue;
+        FileRecord updatedRecord;
+        updatedRecord.fileName = record.fileName;
+
+        std::shared_lock<std::shared_mutex> lock(mtx); // Reading from signatures
+        auto sigIt = signatures.find(updatedRecord.fileName);
+        if (sigIt == signatures.end())
+          throw std::runtime_error("File was not found, directory listings not synced!");
+        auto &[fileName, info] = *sigIt;
+        updatedRecord.info.version = info.version;
+
+        sbuf.clear();
+        msgpack::pack(sbuf, updatedRecord);
+        protocolHandler.writeHeaderBytes(Command::Version, VERSION_WRITE, sbuf.size());
+        protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+        break;
       }
+      // When client edits a file
+      case Command::Update: {
+        result.get().convert(record);
 
-      // TODO: Mutex for the server signatures when all clients write
-      // Send signature and then wait for a delta
-      msgpack::sbuffer sbuf;
-      record.info.signature = FileHandler::generateSignature(record.fileName).signature;
-      msgpack::pack(sbuf, record.info.signature);
-      protocolHandler.writeHeaderBytes(Command::Signature, 0, sbuf.size());
-      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
-      break;
+        /*
+         * TODO: Check if file name is on the server
+         * Use std::map.at()
+         */
+
+        std::shared_lock<std::shared_mutex> lock(mtx); // Reading from signatures
+        auto sigIt = signatures.find(record.fileName);
+        if (sigIt == signatures.end())
+          throw std::runtime_error("File was not found, directory listings not synced!");
+        auto &[fileName, servInfo] = *sigIt;
+
+        if (record.info.version < servInfo.version) {
+          protocolHandler.writeHeaderBytes(Command::Version, VERSION_PULL, 0);
+          continue;
+        }
+
+        // Send signature, next step is Delta
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, servInfo.signature);
+        protocolHandler.writeHeaderBytes(Command::Signature, 0, sbuf.size());
+        protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+        break;
+      }
+      case Command::Delta: {
+        // Apply delta
+        Delta delta;
+        result.get().convert(delta);
+        FileHandler::patchFile(FileDelta{record.fileName, delta});
+
+        std::unique_lock<std::shared_mutex> lock(mtx); // Because changing version
+
+        // Regenerate signature for that file and
+        // Increment version and let client know
+        auto sigIt = signatures.find(record.fileName);
+        if (sigIt == signatures.end())
+          throw std::runtime_error("File was not found, directory listings not synced!");
+        auto &[fileName, info] = *sigIt;
+
+        // Generate signature for new patch
+        info.signature = FileHandler::generateSignature(fileName).signature;
+
+        // Send new version to client
+        auto &version = info.version;
+        version += 1;
+        FileRecord updatedRecord;
+        updatedRecord.fileName = record.fileName;
+        updatedRecord.info.version = version;
+
+        msgpack::sbuffer sbuf;
+        msgpack::pack(sbuf, updatedRecord);
+        protocolHandler.writeHeaderBytes(Command::Version, VERSION_WRITE, sbuf.size());
+        protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+
+        LOG_DEBUG("Updating " << record.fileName << " to v" << version);
+
+        /**
+         * Announce to all clients that file was updated
+         */
+        notifyAllClients(record.fileName);
+
+        break;
+      }
+      case Command::Version: {
+        // Extract file records
+        RecordMap records;
+        result.get().convert(records);
+
+        // Compare versions and then send file deltas and versions for files that are stale
+        sendStaleDeltas(protocolHandler, records);
+        break;
+      }
+      default:
+        break;
+      }
     }
-    case Command::Delta: {
-      // Apply delta
-      Delta delta;
-      result.get().convert(delta);
-      FileHandler::patchFile(FileDelta{record.fileName, delta});
 
-      // Increment version and let client know
-      auto sigIt = signatures.find(record.fileName);
+    // Check for pending server-side file update
+    std::size_t current = globalUpdateCounter.load(std::memory_order_acquire);
+    if (current > myLastSeen) {
+      // File update occured
+      LOG_DEBUG("File update occured from another thread!");
+      // Ask client for signatures
+      std::string updatedFile;
+      {
+        std::lock_guard<std::mutex> lock(fileNameMtx);
+        updatedFile = lastUpdatedFileName;
+      }
+      protocolHandler.writeHeaderBytes(Command::Signature, 0, updatedFile.size());
+      protocolHandler.writeStreamBytes(updatedFile.data(), updatedFile.size());
+
+      // Wait for signature and then calculate delta and send
+      protocolHandler.readHeaderBytes(header);
+      std::string buffer(header.streamLength, '\0');
+      msgpack::object_handle result;
+      protocolHandler.readStreamBytes(buffer, header.streamLength);
+      msgpack::unpack(result, buffer.data(), header.streamLength);
+      Signature signature;
+      result.get().convert(signature);
+
+      // Compute delta on that signature and send
+      Delta delta = FileHandler::generateDelta(FileSignature{updatedFile, signature});
+      protocolHandler.writeHeaderBytes(Command::Delta, 0, delta.size());
+      protocolHandler.writeStreamBytes(delta.data(), delta.size());
+      
+      // Get version of that file
+      std::shared_lock<std::shared_mutex> lock(mtx); // Reading from signatures
+      auto sigIt = signatures.find(updatedFile);
       if (sigIt == signatures.end())
-        throw std::runtime_error("File was not found, directory listings not synced!");
+      throw std::runtime_error("File was not found, directory listings not synced!");
       auto &[fileName, info] = *sigIt;
 
-      auto &version = info.version;
-      version += 1;
-      FileRecord updatedRecord;
-      updatedRecord.fileName = record.fileName;
-      updatedRecord.info.version = version;
-
+      // Send version
       msgpack::sbuffer sbuf;
-      msgpack::pack(sbuf, updatedRecord);
+      msgpack::pack(sbuf, FileRecord{updatedFile, FileInfo{std::nullopt, info.version}});
       protocolHandler.writeHeaderBytes(Command::Version, VERSION_WRITE, sbuf.size());
       protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
 
-      LOG_DEBUG("Updating " << record.fileName << " to v" << version);
-      break;
-    }
-    case Command::Version: {
-      if (counter-- == 1) {
-        std::string message = "hello";
-        protocolHandler.writeHeaderBytes(Command::Signature, 0, message.size());
-        protocolHandler.writeStreamBytes(message.data(), message.size());
-        break;
-      }
-      // Extract file records
-      RecordMap records;
-      result.get().convert(records);
-
-      // Compare versions and then send file deltas and versions for files that are stale
-      sendStaleDeltas(protocolHandler, records);
-      break;
-    }
-    default:
-      break;
+      myLastSeen = current;
     }
   }
 }
 
 void ServerApplication::sendStaleDeltas(ProtocolHandler &protocolHandler, RecordMap &records) {
   // Compare versions and then send file deltas and versions for files that are stale
+  std::shared_lock<std::shared_mutex> lock(mtx);
   RecordMap staleFiles;
   for (auto &[fileName, info] : records) {
     auto sigIt = signatures.find(fileName);
@@ -187,17 +250,17 @@ void ServerApplication::run() {
       continue;
     }
 
-    try {
-      handleSSLSession(ssl.get());
-    } catch (const ConnectionClosed &) {
-      LOG_INFO("Client connection closed.");
-      SSL_shutdown(ssl.get());
-      continue;
-    } catch (const std::exception &e) {
-      LOG_INFO("Client connection closed.");
-      LOG_ERROR("Error: " << e.what());
-      continue;
-    }
+    sessions.push_back(std::thread([this, ssl = std::move(ssl)]() mutable {
+      try {
+        this->handleSSLSession(ssl.get());
+      } catch (const ConnectionClosed &) {
+        LOG_INFO("Client connection closed.");
+        SSL_shutdown(ssl.get());
+      } catch (const std::exception &e) {
+        LOG_INFO("Client connection closed.");
+        LOG_ERROR("Error: " << e.what());
+      }
+    }));
   }
 }
 

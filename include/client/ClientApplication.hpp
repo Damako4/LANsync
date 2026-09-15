@@ -65,6 +65,7 @@ private:
   std::unique_ptr<efsw::FileWatcher> fileWatcher; ///< File watcher thread to call @ref UpdateListener
   efsw::WatchID watchID = -1;
   bool running = false;
+  bool processingVersionPull = false; ///< Flag to prevent reentrancy during version pull
 
   ProtocolHeader header;
   msgpack::object_handle result;

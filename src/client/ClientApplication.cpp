@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-ClientApplication::ClientApplication(const ApplicationConfig &config) : config(config), listener(queue) {
+ClientApplication::ClientApplication(const ApplicationConfig &config) : config(config), listener(queue), processingVersionPull(false) {
   ctx.reset(SSL_CTX_new(TLS_client_method()));
   if (!ctx) {
     throw std::runtime_error("Failed to create SSL_CTX: " + getLastSSLError());
@@ -84,16 +84,17 @@ ClientApplication::ClientApplication(const ApplicationConfig &config) : config(c
 }
 
 void ClientApplication::run() {
-  // Pull server versions
+  // Pull server versions (INITIAL REQUEST)
   msgpack::sbuffer sbuf;
   msgpack::pack(sbuf, signatures);
   protocolHandler.value().writeHeaderBytes(Command::Version, 0, sbuf.size());
   protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
 
+  // BLOCK until we get the FULL initial Version response before processing any file events
   int fd = SSL_get_fd(ssl.get());
   while (true) {
-    // Is there a file event from the listener thread?
-    if (auto event = queue.pop()) {
+    // Process file events only when not doing version pull
+    if (auto event = queue.pop(); !processingVersionPull && event) {
       handleEdit(event.value());
     }
 
@@ -120,14 +121,39 @@ void ClientApplication::run() {
       msgpack::object_handle result;
       msgpack::unpack(result, buffer.data(), header.streamLength);
       switch (header.command) {
+      case Command::Signature: {
+        // Send signature for our file
+        std::string fileName;
+        result.get().convert(fileName);
+        auto sigIt = signatures.find(fileName);
+        if (sigIt == signatures.end())
+          throw std::runtime_error("File was not found, directory listings not synced!");
+        auto &[fn, info] = *sigIt;
+        protocolHandler.value().writeHeaderBytes(Command::Signature, 0, info.signature.value().size());
+        protocolHandler.value().writeStreamBytes(info.signature.value().data(), info.signature.value().size());
+
+        // Get delta and patch with it
+        Delta delta;
+        protocolHandler.value().readHeaderBytes(header);
+        std::string deltaBuffer(header.streamLength, '\0');
+        protocolHandler.value().readStreamBytes(deltaBuffer, header.streamLength);
+        msgpack::unpack(result, buffer.data(), header.streamLength);
+
+        result.get().convert(delta);
+        FileHandler::patchFile(FileDelta{fileName, delta});
+        
+        // Now wait for version
+        processingVersionPull = true;
+      }
       case Command::Version: {
         if (header.flags & VERSION_WRITE) {
           // Update our version with server's authoritative version
           FileRecord updatedRecord;
           result.get().convert(updatedRecord);
-          
+
           auto sigIt = signatures.find(updatedRecord.fileName);
-          if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+          if (sigIt == signatures.end())
+            throw std::runtime_error("File was not found, directory listings not synced!");
           auto &[fileName, info] = *sigIt;
 
           info.version = updatedRecord.info.version;
@@ -140,21 +166,25 @@ void ClientApplication::run() {
             LOG_DEBUG("Updating " << fileName << " to v" << serverInfo.version);
 
             auto sigIt = signatures.find(fileName);
-            if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+            if (sigIt == signatures.end())
+              throw std::runtime_error("File was not found, directory listings not synced!");
             auto &[fn, info] = *sigIt;
             info.version = serverInfo.version;
 
             FileHandler::patchFile(FileDelta{fileName, serverInfo.signature.value()});
+
+            // Generate new signature for patched file
+            info.signature = FileHandler::generateSignature(fileName).signature;
           }
         }
+        processingVersionPull = false;
       }
       default:
         break;
       }
     }
-
-    shutdown();
   }
+  shutdown();
 }
 
 void ClientApplication::handleEdit(const FileEvent &event) {
@@ -163,7 +193,8 @@ void ClientApplication::handleEdit(const FileEvent &event) {
 
   // Send server file record, containing fileName and version (Command::Update)
   auto sigIt = signatures.find(event.fileName);
-  if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+  if (sigIt == signatures.end())
+    throw std::runtime_error("File was not found, directory listings not synced!");
   auto &[fileName, info] = *sigIt;
 
   msgpack::pack(sbuf, FileRecord{fileName, FileInfo{std::nullopt, info.version}});
@@ -174,9 +205,13 @@ void ClientApplication::handleEdit(const FileEvent &event) {
   protocolHandler.value().readHeaderBytes(header);
   if (header.command == Command::Version) {
     // File out of date, send signature for server to generate delta with
+    auto sigIt = signatures.find(fileName);
+    if (sigIt == signatures.end())
+      throw std::runtime_error("File was not found, directory listings not synced!");
+    auto &record = *sigIt;
+
     sbuf.clear();
-    msgpack::sbuffer sbuf;
-    msgpack::pack(sbuf, FileRecord{fileName, FileInfo{FileHandler::generateSignature(fileName).signature, 0 }}); // Version # doesn't matter, server will give latest
+    msgpack::pack(sbuf, record); // Just pack the current record, it will contain updated signature.
     protocolHandler.value().writeHeaderBytes(Command::Signature, 0, sbuf.size());
     protocolHandler.value().writeStreamBytes(sbuf.data(), sbuf.size());
 
@@ -190,6 +225,13 @@ void ClientApplication::handleEdit(const FileEvent &event) {
     result.get().convert(fileDelta);
     FileHandler::patchFile(fileDelta);
     LOG_DEBUG("File out of date, requesting newer version: " << event.fileName);
+
+    // Generate new signature for patched file
+    record.second.signature = FileHandler::generateSignature(fileName).signature;
+
+    // Waiting for version, don't handle other file edits
+    processingVersionPull = true;
+
     /**
      * TODO: Handle what happens when a client's version is stale,
      * right now it just overwrites the user's changes to that file
@@ -200,7 +242,6 @@ void ClientApplication::handleEdit(const FileEvent &event) {
   std::string buffer(header.streamLength, '\0');
   protocolHandler.value().readStreamBytes(buffer, header.streamLength);
   msgpack::unpack(result, buffer.data(), header.streamLength);
-
 
   Signature serverSignature;
   result.get().convert(serverSignature);

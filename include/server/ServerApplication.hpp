@@ -7,6 +7,7 @@
 #include <map>
 #include <ProtocolHandler.hpp>
 #include <Types.hpp>
+#include <shared_mutex>
 
 class ServerApplication {
 public:
@@ -18,6 +19,8 @@ public:
      * @param config Application settings
      */
     ServerApplication(const ApplicationConfig& config);
+
+    ~ServerApplication();
     
     /**
      * @brief Run the acceptor loop for clients, handling each client with 
@@ -45,7 +48,29 @@ private:
     void handleSSLSession(SSL* ssl);
 
     RecordMap signatures; ///< RecordMap containing the servers latest signatures
-    RecordMap serverDeltas; ///< @ref DeltaMap containing the servers latest deltas
     std::unique_ptr<BIO, BioDeleter> acceptor;
     std::unique_ptr<SSL_CTX, SslCtxDeleter> ctx;    
+
+    mutable std::shared_mutex mtx; ///< Protects signatures
+    std::vector<std::thread> sessions; ///< All active SSL session threads
+
+    std::atomic<std::size_t> globalUpdateCounter{0}; ///< Generation counter file file updates
+
+    std::string lastUpdatedFileName; ///< Last updated file
+    std::mutex fileNameMtx; ///< Protects last updated file
+
+    /**
+     * @brief Notifies all session threads of file update by incrementing counter
+     */
+    void notifyAllClients(const std::string &fileName) { 
+        {
+            std::lock_guard<std::mutex> lock(fileNameMtx);
+            lastUpdatedFileName = fileName;
+        }
+        globalUpdateCounter.fetch_add(1, std::memory_order_release); 
+    };
+
+    // Disallow copying / moving
+    ServerApplication(const ServerApplication&) = delete;
+    ServerApplication& operator=(const ServerApplication&) = delete;
 };
