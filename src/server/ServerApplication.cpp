@@ -1,4 +1,5 @@
 #include <FileHandler.hpp>
+#include <Logging.hpp>
 #include <ProtocolHandler.hpp>
 #include <ServerApplication.hpp>
 #include <Tools.hpp>
@@ -9,7 +10,6 @@
 #include <msgpack.hpp>
 #include <openssl/err.h>
 #include <vector>
-#include <Logging.hpp>
 
 namespace filesystem = std::filesystem;
 
@@ -20,7 +20,7 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
   while (true) {
     // Read header bytes
     protocolHandler.readHeaderBytes(header);
-    
+
     // Read stream bytes
     std::string buffer(header.streamLength, '\0');
     msgpack::object_handle result;
@@ -40,9 +40,10 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
 
       FileRecord updatedRecord;
       updatedRecord.fileName = record.fileName;
-      
+
       auto sigIt = signatures.find(updatedRecord.fileName);
-      if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+      if (sigIt == signatures.end())
+        throw std::runtime_error("File was not found, directory listings not synced!");
       auto &[fileName, info] = *sigIt;
       updatedRecord.info.version = info.version;
 
@@ -56,23 +57,19 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
     case Command::Update: {
       result.get().convert(record);
 
-      /* 
+      /*
        * TODO: Check if file name is on the server
        * Use std::map.at()
        */
 
       auto sigIt = signatures.find(record.fileName);
-      if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+      if (sigIt == signatures.end())
+        throw std::runtime_error("File was not found, directory listings not synced!");
       auto &[fileName, info] = *sigIt;
 
       if (record.info.version < info.version) {
-        // Client file version is stale, tell client to pull this file version
-        RecordMap records;
-        records.emplace(record.fileName, record.info);
-        msgpack::sbuffer sbuf;
-        msgpack::pack(sbuf, records);
-        protocolHandler.writeHeaderBytes(Command::Version, VERSION_PULL, sbuf.size());
-        protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+        // Client file version is stale, send client deltas to patch with
+        sendStaleDeltas(protocolHandler, RecordMap{{fileName, record.info}});
         continue;
       }
 
@@ -93,7 +90,8 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
 
       // Increment version and let client know
       auto sigIt = signatures.find(record.fileName);
-      if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
+      if (sigIt == signatures.end())
+        throw std::runtime_error("File was not found, directory listings not synced!");
       auto &[fileName, info] = *sigIt;
 
       auto &version = info.version;
@@ -116,29 +114,35 @@ void ServerApplication::handleSSLSession(SSL *ssl) {
       result.get().convert(records);
 
       // Compare versions and then send file deltas and versions for files that are stale
-      RecordMap staleFiles;
-      for (auto &[fileName, info] : records) {
-        auto sigIt = signatures.find(fileName);
-        if (sigIt == signatures.end()) throw std::runtime_error("File was not found, directory listings not synced!");
-        auto &[serverFileName, serverInfo] = *sigIt;
-
-        version_t serverVersion = serverInfo.version;
-        if (info.version < serverVersion) {
-          staleFiles.emplace(fileName, FileInfo{FileHandler::generateDelta(FileSignature{fileName, info.signature.value()}), serverVersion});
-        }
-      }
-
-      // Send those stale deltas and versions
-      msgpack::sbuffer sbuf;
-      msgpack::pack(sbuf, staleFiles);
-      protocolHandler.writeHeaderBytes(Command::Version, VERSION_PULL, sbuf.size());
-      protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
+      sendStaleDeltas(protocolHandler, records);
       break;
     }
     default:
       break;
     }
   }
+}
+
+void ServerApplication::sendStaleDeltas(ProtocolHandler &protocolHandler, const RecordMap &records) {
+  // Compare versions and then send file deltas and versions for files that are stale
+  RecordMap staleFiles;
+  for (auto &[fileName, info] : records) {
+    auto sigIt = signatures.find(fileName);
+    if (sigIt == signatures.end())
+      throw std::runtime_error("File was not found, directory listings not synced!");
+    auto &[serverFileName, serverInfo] = *sigIt;
+
+    version_t serverVersion = serverInfo.version;
+    if (info.version < serverVersion) {
+      staleFiles.emplace(fileName, FileInfo{FileHandler::generateDelta(FileSignature{fileName, info.signature.value()}), serverVersion});
+    }
+  }
+
+  // Send those stale deltas and versions
+  msgpack::sbuffer sbuf;
+  msgpack::pack(sbuf, staleFiles);
+  protocolHandler.writeHeaderBytes(Command::Version, VERSION_PULL, sbuf.size());
+  protocolHandler.writeStreamBytes(sbuf.data(), sbuf.size());
 }
 
 void ServerApplication::run() {
@@ -178,7 +182,7 @@ void ServerApplication::run() {
       LOG_INFO("Client connection closed.");
       LOG_ERROR("Error: " << e.what());
       continue;
-    }    
+    }
   }
 }
 

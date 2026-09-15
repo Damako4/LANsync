@@ -18,13 +18,23 @@ public:
      * @param config Application settings
      */
     ServerApplication(const ApplicationConfig& config);
-
     
     /**
      * @brief Run the acceptor loop for clients, handling each client with 
      * @ref handleSSLSession
      */
     void run();
+    
+private:
+    ApplicationConfig config; ///< ApplicationConfig for the server
+
+    /**
+     * @brief Send deltas for all files that are stale in @param records
+     * 
+     * @param ssl The active SSL connection to the client
+     * @param records The client's RecordMap
+     */
+    void sendStaleDeltas(ProtocolHandler &protocolHandler, const RecordMap &records);
 
     /**
      * @brief Handles an incoming SSL session and dispatch commands
@@ -33,8 +43,6 @@ public:
      * @param ssl The active SSL connection to the client
      */
     void handleSSLSession(SSL* ssl);
-private:
-    ApplicationConfig config; ///< ApplicationConfig for the server
 
     RecordMap signatures; ///< RecordMap containing the servers latest signatures
     RecordMap serverDeltas; ///< @ref DeltaMap containing the servers latest deltas
